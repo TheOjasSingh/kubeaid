@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/fatih/color"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -29,6 +28,21 @@ func getKubeClient() (*kubernetes.Clientset, error) {
 	return kubernetes.NewForConfig(config)
 }
 
+func getStatusIcon(status string) string {
+	switch status {
+	case "Running":
+		return "🟢 Running"
+	case "Pending":
+		return "🟡 Pending"
+	case "CrashLoopBackOff":
+		return "🔴 CrashLoopBackOff"
+	case "OOMKilled":
+		return "🔴 OOMKilled"
+	default:
+		return status
+	}
+}
+
 func ListPods(namespace string) {
 	clientset, err := getKubeClient()
 	if err != nil {
@@ -37,9 +51,6 @@ func ListPods(namespace string) {
 	}
 
 	ns := namespace
-	if ns == "" {
-		ns = ""
-	}
 
 	pods, err := clientset.CoreV1().Pods(ns).List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
@@ -47,24 +58,32 @@ func ListPods(namespace string) {
 		return
 	}
 
-	fmt.Println("\nNAME\t\tSTATUS\t\t\tNAMESPACE")
-	fmt.Println("-------------------------------------------------------")
+	// Counters
+	healthy := 0
+	warning := 0
+	critical := 0
 
 	var issues []string
 
-	for _, pod := range pods.Items {
-		status := string(pod.Status.Phase)
-		displayStatus := status
+	// First pass: detect status + count
+	type PodInfo struct {
+		Name      string
+		Namespace string
+		Status    string
+	}
 
-		// Detect deeper issues
+	var podList []PodInfo
+
+	for _, pod := range pods.Items {
+		displayStatus := string(pod.Status.Phase)
+
+		// Detect deeper issues FIRST
 		for _, cs := range pod.Status.ContainerStatuses {
 			if cs.State.Waiting != nil {
-				reason := cs.State.Waiting.Reason
-
-				if reason == "CrashLoopBackOff" {
+				if cs.State.Waiting.Reason == "CrashLoopBackOff" {
 					displayStatus = "CrashLoopBackOff"
 					issues = append(issues,
-						fmt.Sprintf("%s → CrashLoopBackOff (container restarting)", pod.Name))
+						fmt.Sprintf("🔴 %s → CrashLoopBackOff (restarting)", pod.Name))
 				}
 			}
 
@@ -72,38 +91,65 @@ func ListPods(namespace string) {
 				if cs.State.Terminated.Reason == "OOMKilled" {
 					displayStatus = "OOMKilled"
 					issues = append(issues,
-						fmt.Sprintf("%s → OOMKilled (out of memory)", pod.Name))
+						fmt.Sprintf("🔴 %s → OOMKilled (out of memory)", pod.Name))
 				}
 			}
 		}
 
-		// Pending pods
+		// Pending check
 		if pod.Status.Phase == v1.PodPending {
 			displayStatus = "Pending"
 			issues = append(issues,
-				fmt.Sprintf("%s → Pending (possible scheduling issue)", pod.Name))
+				fmt.Sprintf("🟡 %s → Pending (scheduling issue)", pod.Name))
 		}
 
-		// Color formatting
+		// Count AFTER final status decided
 		switch displayStatus {
 		case "Running":
-			color.Green("%s\t%s\t%s", pod.Name, displayStatus, pod.Namespace)
+			healthy++
 		case "Pending":
-			color.Yellow("%s\t%s\t%s", pod.Name, displayStatus, pod.Namespace)
+			warning++
 		case "CrashLoopBackOff", "OOMKilled", "Failed":
-			color.Red("%s\t%s\t%s", pod.Name, displayStatus, pod.Namespace)
-		default:
-			fmt.Printf("%s\t%s\t%s\n", pod.Name, displayStatus, pod.Namespace)
+			critical++
 		}
+
+		podList = append(podList, PodInfo{
+			Name:      pod.Name,
+			Namespace: pod.Namespace,
+			Status:    displayStatus,
+		})
 	}
 
-	// Print Issues Summary
+	// ✅ NOW print summary (after counting)
+	fmt.Println("\nCLUSTER OVERVIEW")
+	fmt.Println("────────────────────────────────────────────")
+	fmt.Printf("🟢 Healthy Pods: %d\n", healthy)
+	fmt.Printf("🟡 Warnings:     %d\n", warning)
+	fmt.Printf("🔴 Critical:     %d\n", critical)
+
+	// ✅ Print table
+	fmt.Println("\nPODS")
+	fmt.Println("────────────────────────────────────────────")
+	fmt.Printf("%-30s %-20s %-20s\n", "NAME", "STATUS", "NAMESPACE")
+
+	for _, p := range podList {
+		statusWithIcon := getStatusIcon(p.Status)
+
+		fmt.Printf("%-30s %-20s %-20s\n",
+			p.Name,
+			statusWithIcon,
+			p.Namespace,
+		)
+	}
+
+	// ✅ Issues section
 	if len(issues) > 0 {
-		fmt.Println("\n⚠ Issues detected:")
+		fmt.Println("\nISSUES")
+		fmt.Println("────────────────────────────────────────────")
 		for _, issue := range issues {
-			color.Red("- %s", issue)
+			fmt.Println(issue)
 		}
 	} else {
-		color.Green("\n✔ No major issues detected")
+		fmt.Println("\n✔ No major issues detected")
 	}
 }
